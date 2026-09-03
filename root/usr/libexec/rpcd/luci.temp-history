@@ -1,0 +1,266 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Void
+# rpcd shell plugin — luci.temp-history
+#
+# WHY THIS EXISTS
+# The mutating operations (flush, reset) must run behind LuCI's session.
+# On OpenWrt 22.03+ they do, via the ucode plugin luci.temp-status. OpenWrt
+# 21.02 has no ucode, and two earlier attempts to authenticate the raw CGI
+# instead both failed for structural reasons worth recording:
+#
+#   a custom header   uhttpd forwards only a FIXED ALLOWLIST of request
+#                     headers to CGI scripts (proc_header_env[] in proc.c),
+#                     so it was discarded before the script ran.
+#   the session cookie  LuCI sets it with path=/cgi-bin/luci
+#                     (dispatcher.lua: build_url()), so per RFC 6265 the
+#                     browser correctly withholds it from a sibling path
+#                     like /cgi-bin/get-temp-history.cgi.
+#
+# A raw CGI under /www/cgi-bin cannot see the LuCI session, by two
+# independent mechanisms. Move the operation to rpcd instead.
+#
+# rpcd's shell-plugin interface has been available since long before ucode,
+# so it works on 21.02 and on everything newer. Exposing flush/reset here
+# means LuCI authenticates them on EVERY OpenWrt version, with no header
+# tricks and no cookie plumbing.
+#
+# PROTOCOL (rpcd plugin.c)
+#   <plugin> list          → print a JSON object of method → argument spec
+#   <plugin> call <method> → arguments arrive as JSON on stdin, result on stdout
+# The ubus object name is this file's name. Must be executable.
+#
+# Only the cold, user-initiated operations live here. getStatus is
+# deliberately NOT exposed: the Status Overview widget polls it every few
+# seconds, and a shell plugin forks per call — which is exactly the cost the
+# ucode backend was introduced to remove. On 21.02 the widget keeps using the
+# CGI's read-only ?live=1 endpoint.
+
+DATA_DIR="/root/website"
+SENSOR_MAP="$DATA_DIR/temp-sensors.conf"
+RESET_FILE="$DATA_DIR/temp-reset.conf"
+SYS_RESET_FILE="$DATA_DIR/sys-reset.conf"
+FLUSH_SCRIPT="/usr/libexec/temp-history/flush-temp-history.sh"
+FAN_SCRIPT="/usr/libexec/temp-history/fan-control.sh"
+SETP_SCRIPT="/usr/libexec/temp-history/glfan-setpoints.sh"
+DEV_SCRIPT="/usr/libexec/temp-history/device-info.sh"
+EVT_SCRIPT="/usr/libexec/temp-history/events.sh"
+
+# Extract one integer field from the arguments JSON. jshn is present on every
+# OpenWrt install, but this runs in rpcd's context and a missing include would
+# be a silent failure, so fall back to plain parameter expansion.
+json_int_field() {  # json_int_field <name> <json>
+  _jif_n="$1"; _jif_s="$2"; _jif_v=""
+
+  if [ -r /usr/share/libubox/jshn.sh ]; then
+    # shellcheck source=/dev/null
+    . /usr/share/libubox/jshn.sh
+    json_init
+    if json_load "$_jif_s" 2>/dev/null; then
+      json_get_var _jif_v "$_jif_n" 2>/dev/null
+    fi
+  fi
+
+  if [ -z "$_jif_v" ]; then
+    case "$_jif_s" in
+      *"\"$_jif_n\""*)
+        _jif_v="${_jif_s#*\"$_jif_n\"}"
+        _jif_v="${_jif_v#*:}"
+        _jif_v="${_jif_v%%,*}"
+        _jif_v="${_jif_v%%\}*}"
+        # strip surrounding whitespace and any quotes
+        _jif_v="${_jif_v#"${_jif_v%%[![:space:]]*}"}"
+        _jif_v="${_jif_v%"${_jif_v##*[![:space:]]}"}"
+        _jif_v="${_jif_v#\"}"; _jif_v="${_jif_v%\"}"
+        ;;
+    esac
+  fi
+
+  case "$_jif_v" in
+    ''|*[!0-9]*) printf '' ;;
+    *) printf '%s' "$_jif_v" ;;
+  esac
+}
+
+case "$1" in
+  list)
+    printf '{ "flush": { }, "reset": { "sensor": 0 }, "getFan": { }, "setFan": { "percent": 0, "minutes": 0 }, "autoFan": { }, "getSetpoints": { }, "setSetpoints": { "min": 0, "max": 0 }, "resetSetpoints": { }, "getDevice": { }, "resetSys": { "col": 0 }, "getEvents": { "limit": 0 } }\n'
+    ;;
+
+  call)
+    case "$2" in
+      flush)
+        if [ -x "$FLUSH_SCRIPT" ]; then
+          "$FLUSH_SCRIPT"
+        else
+          printf '{"status":"error","error":"flush helper missing at %s"}\n' "$FLUSH_SCRIPT"
+        fi
+        ;;
+
+      reset)
+        INPUT=$(cat)
+        IDX=$(json_int_field sensor "$INPUT")
+        if [ -z "$IDX" ]; then
+          printf '{"status":"error","error":"invalid sensor index"}\n'
+          exit 0
+        fi
+
+        NSENS=$(awk 'BEGIN{FS="\t";n=0} /^#/{next} NF>=2{n++} END{print n+0}' "$SENSOR_MAP" 2>/dev/null)
+        case "$NSENS" in ''|*[!0-9]*) NSENS=0 ;; esac
+        if [ "$IDX" -ge "$NSENS" ]; then
+          printf '{"status":"error","error":"no such sensor"}\n'
+          exit 0
+        fi
+
+        NOW=$(date +%s)
+        mkdir -p "$DATA_DIR"
+        TMP="/tmp/th_reset_rpcd_$$.tmp"
+        trap 'rm -f "$TMP"' EXIT INT TERM HUP
+        TAB="	"
+        grep -v "^${IDX}${TAB}" "$RESET_FILE" 2>/dev/null > "$TMP" || true
+        printf '%s\t%s\n' "$IDX" "$NOW" >> "$TMP"
+        if mv "$TMP" "$RESET_FILE"; then
+          printf '{"status":"ok","sensor":%s,"reset_ts":%s}\n' "$IDX" "$NOW"
+        else
+          printf '{"status":"error","error":"cannot write %s"}\n' "$RESET_FILE"
+        fi
+        ;;
+
+      getFan)
+        if [ -x "$FAN_SCRIPT" ]; then
+          "$FAN_SCRIPT" status
+        else
+          printf '{"status":"error","error":"fan helper missing"}\n'
+        fi
+        ;;
+
+      setFan)
+        # Validation, the min-percent floor, the crit refusal and the override
+        # timeout all live in fan-control.sh — this only marshals arguments,
+        # so both backends behave identically.
+        INPUT=$(cat)
+        PCT=$(json_int_field percent "$INPUT")
+        MINS=$(json_int_field minutes "$INPUT")
+        if [ -z "$PCT" ] || [ "$PCT" -gt 100 ]; then
+          printf '{"status":"error","error":"percent must be 0-100"}\n'
+          exit 0
+        fi
+        if [ -x "$FAN_SCRIPT" ]; then
+          if [ -n "$MINS" ] && [ "$MINS" -gt 0 ]; then
+            "$FAN_SCRIPT" set "$PCT" "$MINS"
+          else
+            "$FAN_SCRIPT" set "$PCT"
+          fi
+        else
+          printf '{"status":"error","error":"fan helper missing"}\n'
+        fi
+        ;;
+
+      autoFan)
+        if [ -x "$FAN_SCRIPT" ]; then
+          "$FAN_SCRIPT" auto
+        else
+          printf '{"status":"error","error":"fan helper missing"}\n'
+        fi
+        ;;
+
+      # ── GL.iNet thermal setpoints ────────────────────────────────────
+      # Same delegation as the fan methods: the hierarchy rules, the baseline
+      # restore and the web-UI opt-in live in glfan-setpoints.sh so the two
+      # backends cannot drift apart.
+      getSetpoints)
+        if [ -x "$SETP_SCRIPT" ]; then
+          "$SETP_SCRIPT" status
+        else
+          # Not an error. A router without the helper has no setpoints to
+          # report, which is the same answer as a router that is not GL.iNet,
+          # and the page hides the section either way.
+          printf '{"supported":false,"reason":"setpoint helper missing"}\n'
+        fi
+        ;;
+
+      setSetpoints)
+        INPUT=$(cat)
+        LO=$(json_int_field min "$INPUT")
+        HI=$(json_int_field max "$INPUT")
+        if [ -z "$LO" ] || [ "$LO" -gt 120 ]; then
+          printf '{"status":"error","error":"minimum must be 0-120 °C"}\n'
+          exit 0
+        fi
+        if [ -z "$HI" ] || [ "$HI" -gt 120 ]; then
+          printf '{"status":"error","error":"maximum must be 0-120 °C"}\n'
+          exit 0
+        fi
+        if [ -x "$SETP_SCRIPT" ]; then
+          "$SETP_SCRIPT" set "$LO" "$HI"
+        else
+          printf '{"status":"error","error":"setpoint helper missing"}\n'
+        fi
+        ;;
+
+      resetSetpoints)
+        if [ -x "$SETP_SCRIPT" ]; then
+          "$SETP_SCRIPT" reset
+        else
+          printf '{"status":"error","error":"setpoint helper missing"}\n'
+        fi
+        ;;
+
+      # Model and firmware, for the line at the foot of the page. Not an error
+      # when the helper is absent — the page just draws nothing there.
+      resetSys)
+        INPUT=$(cat)
+        COL=$(json_int_field col "$INPUT")
+        if [ -z "$COL" ] || [ "$COL" -gt 2 ]; then
+          printf '{"status":"error","error":"invalid system column"}\n'
+          exit 0
+        fi
+        NOW=$(date +%s)
+        mkdir -p "$DATA_DIR"
+        TMP="/tmp/th_sysreset_rpcd_$$.tmp"
+        trap 'rm -f "$TMP"' EXIT INT TERM HUP
+        TAB="	"
+        grep -v "^${COL}${TAB}" "$SYS_RESET_FILE" 2>/dev/null > "$TMP" || true
+        printf '%s\t%s\n' "$COL" "$NOW" >> "$TMP"
+        if mv "$TMP" "$SYS_RESET_FILE"; then
+          printf '{"status":"ok","col":%s,"reset_ts":%s}\n' "$COL" "$NOW"
+        else
+          printf '{"status":"error","error":"cannot write %s"}\n' "$SYS_RESET_FILE"
+        fi
+        ;;
+
+      # Threshold crossings and fan stalls, read back out of syslog. The
+      # collector has always logged them; this is the first thing that shows
+      # them. Read-only, and never mirrored onto the CGI — the log is the one
+      # place unrelated daemons write unpredictable text, and /www/cgi-bin is
+      # unauthenticated by construction.
+      getEvents)
+        INPUT=$(cat)
+        LIM=$(json_int_field limit "$INPUT")
+        case "$LIM" in ''|0) LIM=60 ;; esac
+        [ "$LIM" -gt 500 ] && LIM=60
+        if [ -x "$EVT_SCRIPT" ]; then
+          "$EVT_SCRIPT" "$LIM"
+        else
+          # Not an error: a router with no events and a router with no helper
+          # look the same to the page, and both should just draw nothing.
+          printf '{"supported":false,"reason":"events helper missing","events":[]}\n'
+        fi
+        ;;
+
+      getDevice)
+        if [ -x "$DEV_SCRIPT" ]; then
+          "$DEV_SCRIPT"
+        else
+          printf '{}\n'
+        fi
+        ;;
+
+      *)
+        printf '{"status":"error","error":"unknown method"}\n'
+        ;;
+    esac
+    ;;
+esac
+
+exit 0

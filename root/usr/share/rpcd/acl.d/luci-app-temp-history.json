@@ -1,0 +1,50 @@
+{
+	"luci-app-temp-history": {
+		"description": "Read temperature history, device information and logged thermal events; flush the buffer, reset min/max records, control the fan and its thermal setpoints",
+		"read": {
+			"ubus": {
+				"luci.temp-status": [
+					"getStatus",
+					"getFan",
+					"getSetpoints",
+					"getDevice",
+					"getEvents"
+				],
+				"luci.temp-history": [
+					"getFan",
+					"getSetpoints",
+					"getDevice",
+					"getEvents"
+				]
+			},
+			"uci": [
+				"temp_history"
+			]
+		},
+		"write": {
+			"ubus": {
+				"luci.temp-status": [
+					"flush",
+					"reset",
+					"setFan",
+					"autoFan",
+					"setSetpoints",
+					"resetSetpoints",
+					"resetSys"
+				],
+				"luci.temp-history": [
+					"flush",
+					"reset",
+					"setFan",
+					"autoFan",
+					"setSetpoints",
+					"resetSetpoints",
+					"resetSys"
+				]
+			},
+			"uci": [
+				"temp_history"
+			]
+		}
+	}
+}

@@ -1,0 +1,438 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Void
+'use strict';
+
+// rpcd backend for luci-app-temp-history
+//
+// The MUTATING operations live here, as ubus methods, because ubus is the
+// only path in this package that LuCI actually authenticates. The CGI
+// equivalents (?flush=1 / ?reset=N) are unauthenticated by construction —
+// anything under /www/cgi-bin is — and are gated off automatically wherever
+// these methods are reachable. See get-temp-history.cgi.
+//
+// Methods:
+//   getStatus       (read)  sensor names + current readings + configured thresholds
+//   getFan          (read)  fan RPM, pwm, override mode and remaining time
+//   getSetpoints    (read)  GL.iNet gl_fan setpoints, or supported:false
+//   getEvents       (read)  threshold crossings and fan stalls, from syslog
+//   flush           (write) commit the RAM buffer to flash
+//   reset           (write) clear one sensor's min/max records
+//   resetSys        (write) clear one CPU/memory column's min/max records
+//   setFan          (write) manual speed override, auto-expiring
+//   autoFan         (write) hand the fan straight back to the kernel governor
+//   setSetpoints    (write) new minimum/maximum thermal setpoints
+//   resetSetpoints  (write) restore the firmware's factory setpoints
+//
+// ucode is only available from OpenWrt 22.03 onward. On 21.02 this file is
+// never loaded, no methods exist, and the frontend falls back to the CGI.
+
+import { readfile, writefile, popen } from 'fs';
+import { cursor } from 'uci';
+
+const DATA_DIR     = '/root/website';
+const SENSOR_MAP   = DATA_DIR + '/temp-sensors.conf';
+const FAN_MAP      = DATA_DIR + '/fan-sensors.conf';
+const RESET_FILE   = DATA_DIR + '/temp-reset.conf';
+// Separate from temp-reset.conf on purpose: that file is keyed by SENSOR
+// INDEX, so a system column numbered 0 would silently share sensor 0 cutoff.
+const SYS_RESET    = DATA_DIR + '/sys-reset.conf';
+const FLUSH_SCRIPT = '/usr/libexec/temp-history/flush-temp-history.sh';
+const FAN_SCRIPT   = '/usr/libexec/temp-history/fan-control.sh';
+const SETP_SCRIPT  = '/usr/libexec/temp-history/glfan-setpoints.sh';
+const DEV_SCRIPT   = '/usr/libexec/temp-history/device-info.sh';
+const EVT_SCRIPT   = '/usr/libexec/temp-history/events.sh';
+
+const DEFAULT_WARN = 65;
+const DEFAULT_CRIT = 80;
+
+// int() yields NaN for unparseable input and 0 for null, so neither result
+// can stand in for "option absent" on its own.
+function num(v, dflt) {
+	if (v == null || v === '')
+		return dflt;
+	let n = int(v);
+	return (n != n) ? dflt : n;
+}
+
+function thresholds() {
+	let warn = DEFAULT_WARN, crit = DEFAULT_CRIT;
+	try {
+		let c = cursor();
+		c.load('temp_history');
+		warn = num(c.get('temp_history', 'main', 'warn_temp'), DEFAULT_WARN);
+		crit = num(c.get('temp_history', 'main', 'crit_temp'), DEFAULT_CRIT);
+	} catch (e) {
+		// No config yet (fresh install before postinst, or someone deleted
+		// it) — the compiled-in defaults are a fine answer.
+	}
+	if (crit <= warn) crit = warn + 1;
+	return { warn, crit };
+}
+
+// Reads one sysfs millidegree file and returns °C, or 0.0 if unreadable —
+// same "0.0 means unavailable" convention get-temp-history.cgi uses, so
+// both backends produce an identical payload shape for the widget.
+function readTempC(path) {
+	let raw = readfile(path);
+	if (!raw) return 0.0;
+	let v = num(trim(raw), 0);
+	return (v > 0) ? (v / 1000.0) : 0.0;
+}
+
+// path\tname per line — the same file the collector and CGI use, so sensor
+// order always matches the History page.
+function sensorRows() {
+	let rows = [];
+	let conf = readfile(SENSOR_MAP);
+	if (!conf)
+		return rows;
+	for (let line in split(conf, "\n")) {
+		line = replace(line, "\r", "");
+		if (line == '' || substr(line, 0, 1) == '#') continue;
+		let parts = split(line, "\t");
+		if (length(parts) < 2) continue;
+		push(rows, { path: parts[0], name: parts[1] });
+	}
+	return rows;
+}
+
+// tach_path <TAB> name <TAB> pwm_path <TAB> pwm_enable, "-" for absent.
+// Same file the collector and CGI read, so the widget lists fans in the same
+// order as the History page.
+function fanRows() {
+	let rows = [];
+	let conf = readfile(FAN_MAP);
+	if (!conf)
+		return rows;
+	for (let line in split(conf, "\n")) {
+		line = replace(line, "\r", "");
+		if (line == '' || substr(line, 0, 1) == '#') continue;
+		let parts = split(line, "\t");
+		if (length(parts) < 2) continue;
+		push(rows, { tach: parts[0], name: parts[1] });
+	}
+	return rows;
+}
+
+// null = no tachometer or unreadable. 0 is a REAL reading: the fan has
+// stopped. The widget renders those differently and must be able to tell
+// them apart, so this returns null rather than 0 for "no reading".
+function readRpm(path) {
+	if (path == '-') return null;
+	let raw = readfile(path);
+	if (!raw) return null;
+	let v = int(trim(raw));
+	return (v != v) ? null : v;
+}
+
+// ── CPU and memory, for the Status Overview widget ──────────────────
+// Native, not a shell-out: this is on the widget poll, and a fork per poll is
+// exactly the cost this ucode backend exists to remove.
+//
+// CPU needs a baseline, and this gets its OWN — the collector's belongs to the
+// 15-minute series and the CGI has a third for the page. Three consumers
+// polling at three cadences cannot share one, and the failure would be silent:
+// each would shorten the others average window.
+const CPU_WIDGET_STATE = '/tmp/temp-history-cpu-widget.state';
+
+function cpuNow() {
+	let raw = readfile('/proc/stat');
+	if (!raw) return null;
+	let line = split(raw, "\n")[0];
+	if (!line || substr(line, 0, 4) != 'cpu ') return null;
+
+	let f = [], parts = split(trim(substr(line, 4)), ' ');
+	for (let p in parts)
+		if (p != '') push(f, int(p));
+	if (length(f) < 5) return null;
+
+	// user nice system idle iowait ... — idle and iowait are both "not busy".
+	let tot = 0;
+	for (let v in f) tot += v;
+	let idle = f[3] + f[4];
+
+	let prev = readfile(CPU_WIDGET_STATE);
+	writefile(CPU_WIDGET_STATE, sprintf("%d %d\n", tot, idle));
+	if (!prev) return null;
+
+	let pp = split(trim(prev), ' ');
+	let ptot = num(pp[0], 0), pidle = num(pp[1], 0);
+	if (ptot <= 0) return null;
+
+	let dt = tot - ptot, di = idle - pidle;
+	if (dt <= 0 || di < 0) return null;
+	let busy = dt - di;
+	if (busy < 0) busy = 0;
+	return (int(busy * 1000 / dt + 0.5)) / 10.0;
+}
+
+function memNow() {
+	let raw = readfile('/proc/meminfo');
+	if (!raw) return null;
+	let mt = 0, mf = 0, ma = 0, mb = 0, mc = 0;
+	for (let line in split(raw, "\n")) {
+		let p = split(line, ':');
+		if (length(p) < 2) continue;
+		let v = num(trim(replace(p[1], 'kB', '')), 0);
+		switch (trim(p[0])) {
+			case 'MemTotal':     mt = v; break;
+			case 'MemFree':      mf = v; break;
+			case 'MemAvailable': ma = v; break;
+			case 'Buffers':      mb = v; break;
+			case 'Cached':       mc = v; break;
+		}
+	}
+	if (mt <= 0) return null;
+	// MemAvailable arrived in Linux 3.14; older kernels get the approximation
+	// everything used before it existed.
+	if (ma == 0) ma = mf + mb + mc;
+	if (ma > mt) ma = mt;
+	return {
+		mem:        (int((mt - ma) * 1000 / mt + 0.5)) / 10.0,
+		mem_cached: (int((mt - mf) * 1000 / mt + 0.5)) / 10.0
+	};
+}
+
+function sysNow() {
+	let m = memNow();
+	return {
+		cpu:        cpuNow(),
+		mem:        m ? m.mem : null,
+		mem_cached: m ? m.mem_cached : null
+	};
+}
+
+function getStatus() {
+	let sensors = [], current = [];
+	for (let r in sensorRows()) {
+		push(sensors, r.name);
+		push(current, readTempC(r.path));
+	}
+
+	// The Overview widget renders fan cards from these two arrays. They must
+	// be returned here as well as by the CGI, or the widget has nothing to
+	// draw on any router that reaches this backend.
+	let fans = [], fan_rpm = [];
+	for (let f in fanRows()) {
+		push(fans, f.name);
+		push(fan_rpm, readRpm(f.tach));
+	}
+
+	let t = thresholds();
+	return { sensors, current, fans, fan_rpm, sys_now: sysNow(),
+	         warn: t.warn, crit: t.crit };
+}
+
+// Runs a helper and hands back the JSON object it printed. Anything that is
+// not a JSON object is reported as an error rather than passed through.
+function run_json(cmd, what) {
+	let p = popen(cmd + ' 2>/dev/null');
+	if (!p)
+		return { status: 'error', error: 'cannot run ' + what };
+	let out = p.read('all');
+	p.close();
+	try {
+		let r = json(trim(out));
+		if (type(r) == 'object')
+			return r;
+	} catch (e) {}
+	return { status: 'error', error: 'unexpected output from ' + what };
+}
+
+// ── Fan ─────────────────────────────────────────────────────────────
+// Delegates to fan-control.sh so the failsafe, the minimum-speed floor and
+// the override timeout live in exactly one place rather than being
+// reimplemented per backend.
+function getFan() {
+	return run_json(FAN_SCRIPT + ' status', 'fan-control status');
+}
+
+function setFan(request) {
+	let args = request?.args;
+	let pct  = num(args ? args.percent : null, -1);
+	let mins = num(args ? args.minutes : null, 0);
+
+	if (pct < 0 || pct > 100)
+		return { status: 'error', error: 'percent must be 0-100' };
+
+	let cmd = FAN_SCRIPT + ' set ' + pct;
+	if (mins > 0)
+		cmd += ' ' + mins;
+	return run_json(cmd, 'fan-control set');
+}
+
+function autoFan() {
+	return run_json(FAN_SCRIPT + ' auto', 'fan-control auto');
+}
+
+// ── GL.iNet thermal setpoints ───────────────────────────────────────
+// Delegates to glfan-setpoints.sh for the same reason the fan methods
+// delegate: the hierarchy rules, the baseline restore and the web-UI opt-in
+// are one implementation shared with the 21.02 shell backend and with SSH.
+//
+// getSetpoints answers { supported: false, reason } on anything that is not
+// GL.iNet firmware, rather than erroring — "this router has no gl_fan" is a
+// correct answer to the question, not a failure to answer it, and the page
+// needs to tell the two apart to decide whether to render the section at all.
+function getSetpoints() {
+	return run_json(SETP_SCRIPT + ' status', 'setpoints status');
+}
+
+function setSetpoints(request) {
+	let args = request?.args;
+	let lo = num(args ? args.min : null, -1);
+	let hi = num(args ? args.max : null, -1);
+
+	// Bounds are re-checked in the helper, which is the only place that may
+	// decide them. These two exist to keep a nonsense value from reaching a
+	// shell command line at all.
+	if (lo < 0 || lo > 120)
+		return { status: 'error', error: 'minimum must be 0-120 °C' };
+	if (hi < 0 || hi > 120)
+		return { status: 'error', error: 'maximum must be 0-120 °C' };
+
+	return run_json(SETP_SCRIPT + ' set ' + lo + ' ' + hi, 'setpoints set');
+}
+
+function resetSetpoints() {
+	return run_json(SETP_SCRIPT + ' reset', 'setpoints reset');
+}
+
+// Model and firmware for the line at the foot of the page. Read-only, and
+// deliberately not on the CGI: that endpoint is unauthenticated, and a
+// firmware version is the first thing worth knowing if you are hunting for a
+// router with a published CVE.
+function getDevice() {
+	return run_json(DEV_SCRIPT, 'device-info');
+}
+
+// The collector has always logged threshold crossings and fan stalls with
+// `logger -t temp-history`, where nobody would ever see them. This reads them
+// back for the Events panel. Read-only, and NOT mirrored onto the CGI: the
+// system log is the one file on a router where unrelated daemons write
+// unpredictable text, and /www/cgi-bin is unauthenticated by construction.
+function getEvents(request) {
+	let n = num(request?.args ? request.args.limit : null, 60);
+	if (n < 1 || n > 500)
+		n = 60;
+	// A router with no events yet and a router with no logread are the same
+	// answer to the page: draw nothing. Neither is an error worth a red banner.
+	if (!readfile(EVT_SCRIPT))
+		return { supported: false, reason: 'events helper missing', events: [] };
+	return run_json(EVT_SCRIPT + ' ' + n, 'events helper');
+}
+
+function doFlush() {
+	return run_json(FLUSH_SCRIPT, 'flush helper');
+}
+
+// Writes a per-sensor cutoff into temp-reset.conf. Done natively rather than
+// by shelling out: it is a three-line file rewrite and forking for it would
+// be the only fork in the whole ubus path.
+function doReset(request) {
+	let args = request?.args;
+	let idx  = num(args ? args.sensor : null, -1);
+
+	if (idx < 0)
+		return { status: 'error', error: 'invalid sensor index' };
+	if (idx >= length(sensorRows()))
+		return { status: 'error', error: 'no such sensor' };
+
+	let now = time();
+	let keep = [];
+	let existing = readfile(RESET_FILE);
+	if (existing) {
+		for (let line in split(existing, "\n")) {
+			line = replace(line, "\r", "");
+			if (line == '') continue;
+			let parts = split(line, "\t");
+			if (length(parts) < 2) continue;
+			if (num(parts[0], -1) == idx) continue;   // drop the old cutoff
+			push(keep, line);
+		}
+	}
+	push(keep, sprintf("%d\t%d", idx, now));
+
+	if (writefile(RESET_FILE, join("\n", keep) + "\n") == null)
+		return { status: 'error', error: 'cannot write ' + RESET_FILE };
+
+	return { status: 'ok', sensor: idx, reset_ts: now };
+}
+
+// Clears the min/max records for one CPU/memory column, the same way doReset
+// clears them for one sensor. Written natively rather than shelled out: it is
+// a three-line file rewrite, and forking for it would be the only fork on the
+// whole ubus path.
+function resetSys(request) {
+	let args = request?.args;
+	let col  = num(args ? args.col : null, -1);
+
+	if (col < 0 || col > 2)
+		return { status: 'error', error: 'invalid system column' };
+
+	let now = time();
+	let keep = [];
+	let existing = readfile(SYS_RESET);
+	if (existing) {
+		for (let line in split(existing, "\n")) {
+			line = replace(line, "\r", "");
+			if (line == '') continue;
+			let parts = split(line, "\t");
+			if (length(parts) < 2) continue;
+			if (num(parts[0], -1) == col) continue;
+			push(keep, line);
+		}
+	}
+	push(keep, sprintf("%d\t%d", col, now));
+
+	if (writefile(SYS_RESET, join("\n", keep) + "\n") == null)
+		return { status: 'error', error: 'cannot write ' + SYS_RESET };
+
+	return { status: 'ok', col: col, reset_ts: now };
+}
+
+const methods = {
+	getStatus: {
+		call: getStatus
+	},
+	flush: {
+		call: doFlush
+	},
+	getFan: {
+		call: getFan
+	},
+	setFan: {
+		args: { percent: 0, minutes: 0 },
+		call: setFan
+	},
+	autoFan: {
+		call: autoFan
+	},
+	reset: {
+		args: { sensor: 0 },
+		call: doReset
+	},
+	getSetpoints: {
+		call: getSetpoints
+	},
+	setSetpoints: {
+		args: { min: 0, max: 0 },
+		call: setSetpoints
+	},
+	resetSetpoints: {
+		call: resetSetpoints
+	},
+	getDevice: {
+		call: getDevice
+	},
+	getEvents: {
+		args: { limit: 0 },
+		call: getEvents
+	},
+	resetSys: {
+		args: { col: 0 },
+		call: resetSys
+	}
+};
+
+return { 'luci.temp-status': methods };
