@@ -20,6 +20,7 @@ FLUSH="$HELPER_DIR/flush-temp-history.sh"
 FANCTL="$HELPER_DIR/fan-control.sh"
 SETPOINTS="$HELPER_DIR/glfan-setpoints.sh"
 DEVINFO="$HELPER_DIR/device-info.sh"
+EVENTS="$HELPER_DIR/events.sh"
 CGI="/www/cgi-bin/get-temp-history.cgi"
 RPCD_PLUGIN="/usr/libexec/rpcd/luci.temp-history"
 DATA_DIR="/root/website"
@@ -28,7 +29,12 @@ do_install() {
   # rpcd SKIPS any file in /usr/libexec/rpcd without the user-execute bit
   # (plugin.c: !(s.st_mode & S_IXUSR) -> continue), so this chmod is what
   # makes the authenticated flush/reset methods exist at all.
-  chmod 0755 "$COLLECT" "$FLUSH" "$FANCTL" "$SETPOINTS" "$DEVINFO" "$CGI" "$RPCD_PLUGIN" 2>/dev/null
+  # Every helper the backends gate on with [ -x ], not just the ones rpcd
+  # loads directly: a non-executable events.sh makes getEvents report
+  # supported:false, and the panel then says "nothing logged" — which is the
+  # one thing it exists to never say wrongly.
+  chmod 0755 "$COLLECT" "$FLUSH" "$FANCTL" "$SETPOINTS" "$DEVINFO" "$EVENTS" \
+             "$CGI" "$RPCD_PLUGIN" 2>/dev/null
 
   mkdir -p "$DATA_DIR"
 

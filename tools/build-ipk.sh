@@ -71,16 +71,21 @@ printf '/etc/config/temp_history\n' > "$WORK/ctl/conffiles"
 
 # Identical to the Makefile's definitions: three lines calling the shipped
 # setup script, which is where the real work lives.
+#
+# Invoked as `sh <path>`, not as `<path>`, so it does not need its own execute
+# bit. A tree cloned on Windows has every file at 0644, and an SDK build copies
+# those modes straight through — at which point a postinst that execs the
+# script fails, and nothing that setup.sh chmods afterwards ever happens.
 cat > "$WORK/ctl/postinst" <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
-/usr/libexec/temp-history/setup.sh install
+sh /usr/libexec/temp-history/setup.sh install
 exit 0
 EOF
 cat > "$WORK/ctl/prerm" <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
-/usr/libexec/temp-history/setup.sh remove
+sh /usr/libexec/temp-history/setup.sh remove
 exit 0
 EOF
 chmod 0755 "$WORK/ctl/postinst" "$WORK/ctl/prerm"
