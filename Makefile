@@ -14,7 +14,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-temp-history
-PKG_VERSION:=1.0.0
+PKG_VERSION:=1.0.2
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=Void
@@ -49,18 +49,18 @@ endef
 # The real work lives in a shipped script, so these stay three lines, the
 # standalone builder in tools/ can produce identical control scripts, and the
 # whole thing can be re-run by hand if a crontab is ever wiped:
-#     /usr/libexec/temp-history/setup.sh install
+#     sh /usr/libexec/temp-history/setup.sh install
 define Package/$(PKG_NAME)/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
-/usr/libexec/temp-history/setup.sh install
+sh /usr/libexec/temp-history/setup.sh install
 exit 0
 endef
 
 define Package/$(PKG_NAME)/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
-/usr/libexec/temp-history/setup.sh remove
+sh /usr/libexec/temp-history/setup.sh remove
 exit 0
 endef
 

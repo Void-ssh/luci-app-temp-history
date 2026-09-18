@@ -53,6 +53,23 @@ SYS_FILE="$DATA_DIR/sys-history.tsv"
 SYS_BUF="/tmp/sys-history-buf.log"
 LOCK_DIR="/tmp/temp-history-flush.lock"
 
+# ── stdout is reserved for the result ──────────────────────────────────────
+# The callers parse this script's ENTIRE stdout as one JSON object: the ucode
+# backend does json(trim(out)) and reports "unexpected output from flush
+# helper" if anything else rode along — a failure message for a flush that
+# actually succeeded, which is the worst kind.
+#
+# Nothing here prints outside the final line, but this script calls uci, awk,
+# sort, grep, find, logger and mv, on firmwares this was never run on. Any one
+# of them writing a byte to stdout would break the contract. So take stdout
+# away from the whole body: fd 3 is the result channel, fd 1 becomes stderr,
+# and every caller already discards stderr. Anything added later is safe by
+# construction rather than by review.
+#
+# Command substitution is unaffected — $(...) redirects fd 1 for its own
+# subshell, so map_paths, flush_one and the rest still capture normally.
+exec 3>&1 1>&2
+
 TAB="	"  # literal tab
 
 TEMP_TAG="#th1"
@@ -77,11 +94,11 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   if [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +5 2>/dev/null)" ]; then
     rmdir "$LOCK_DIR" 2>/dev/null
     mkdir "$LOCK_DIR" 2>/dev/null || {
-      printf '{"status":"busy","flushed_temp":0,"flushed_uptime":0}\n'
+      printf '{"status":"busy","flushed_temp":0,"flushed_uptime":0}\n' >&3
       exit 0
     }
   else
-    printf '{"status":"busy","flushed_temp":0,"flushed_uptime":0}\n'
+    printf '{"status":"busy","flushed_temp":0,"flushed_uptime":0}\n' >&3
     exit 0
   fi
 fi
@@ -296,13 +313,29 @@ roll_daily() {
   fi
 
   # Sort by day then sensor so the file stays readable by eye and by awk.
-  # BusyBox sort supports -k with -t; if it ever fails, keep the unsorted
-  # file rather than losing the rollup.
-  if sort -t"$TAB" -k1,1 -k2,2n "$_rd_tmp" -o "$_rd_tmp.s" 2>/dev/null; then
-    { printf '#tdh1\tday\tsensor\tname\tmin\tmax\tmean\n'
-      grep -v '^#' "$_rd_tmp.s"; } > "$_rd_tmp"
-    rm -f "$_rd_tmp.s"
+  #
+  # A PLAIN REDIRECT, not `sort -o`. On OpenWrt 25.12 this build of sort
+  # accepts -o, exits 0, and writes the sorted output to STDOUT anyway,
+  # creating no file. The old code took that exit status as success, then
+  # truncated the rollup and filled it from a file that did not exist — so
+  # temp-daily.tsv ended up as a bare header on every flush, and the one file
+  # in this package that is never trimmed accumulated nothing at all.
+  #
+  # The sorted text also rode out on stdout, which is what produced
+  # "unexpected output from flush helper" on an otherwise successful flush.
+  #
+  # Built into a THIRD file and moved into place only once it is known good.
+  # The previous version destroyed the data before it knew the replacement
+  # was usable, which is what turned an unsupported option into data loss.
+  if sort -t"$TAB" -k1,1 -k2,2n "$_rd_tmp" > "$_rd_tmp.s" 2>/dev/null &&
+     [ -s "$_rd_tmp.s" ]; then
+    if { printf '#tdh1\tday\tsensor\tname\tmin\tmax\tmean\n'
+         grep -v '^#' "$_rd_tmp.s"; } > "$_rd_tmp.new" 2>/dev/null &&
+       [ -s "$_rd_tmp.new" ]; then
+      mv "$_rd_tmp.new" "$_rd_tmp"
+    fi
   fi
+  rm -f "$_rd_tmp.s" "$_rd_tmp.new"
 
   mv "$_rd_tmp" "$DAILY_FILE"
   DAILY_ROWS=$(grep -vc '^#' "$DAILY_FILE" 2>/dev/null)
@@ -319,8 +352,8 @@ case "$FLUSHED_SYS"    in ''|*[!0-9]*) FLUSHED_SYS=0    ;; esac
 
 if [ -n "$ROTATED" ]; then
   printf '{"status":"ok","flushed_temp":%d,"flushed_uptime":%d,"flushed_fan":%d,"flushed_sys":%d,"daily_rows":%d,"rotated":"%s"}\n' \
-    "$FLUSHED_TEMP" "$FLUSHED_UPTIME" "$FLUSHED_FAN" "$FLUSHED_SYS" "$DAILY_ROWS" "$ROTATED"
+    "$FLUSHED_TEMP" "$FLUSHED_UPTIME" "$FLUSHED_FAN" "$FLUSHED_SYS" "$DAILY_ROWS" "$ROTATED" >&3
 else
   printf '{"status":"ok","flushed_temp":%d,"flushed_uptime":%d,"flushed_fan":%d,"flushed_sys":%d,"daily_rows":%d}\n' \
-    "$FLUSHED_TEMP" "$FLUSHED_UPTIME" "$FLUSHED_FAN" "$FLUSHED_SYS" "$DAILY_ROWS"
+    "$FLUSHED_TEMP" "$FLUSHED_UPTIME" "$FLUSHED_FAN" "$FLUSHED_SYS" "$DAILY_ROWS" >&3
 fi

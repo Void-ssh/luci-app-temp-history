@@ -4,6 +4,56 @@ Notable changes to this project, newest first. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [semantic versioning](https://semver.org/).
 
+## [1.0.2] — 2026-09-18
+
+### Fixed
+
+- **The daily rollup was being destroyed on every flush.** On OpenWrt 25.12
+  this build of `sort` accepts `-o`, exits 0, writes the sorted text to
+  **stdout**, and creates no file. The rollup code took that exit status as
+  success, truncated `temp-daily.tsv`, and refilled it from the file that was
+  never written — leaving a bare header. So the one file in this package that
+  is *never trimmed*, the one that exists to answer "is this router hotter
+  than it was six months ago", accumulated nothing at all. Silently, while the
+  flush reported success.
+
+  The stray stdout from that same `sort` is what produced the
+  "unexpected output from flush helper" banner in 1.0.1.
+
+  Two changes: the sort writes through a plain redirect rather than `-o`, and
+  the result is built in a third file and moved into place only once it is
+  known good. The old code destroyed the data *before* knowing the replacement
+  was usable, which is what turned an unsupported option into data loss.
+
+  The regression test stubs a `sort` that behaves exactly like that one. It has
+  to run under **dash**: BusyBox ash resolves `sort` as a built-in applet and
+  never consults `PATH`, so under ash the stub is invisible.
+
+## [1.0.1] — 2026-09-18
+
+### Fixed
+
+- **"Flush failed: unexpected output from flush helper" on a flush that
+  actually succeeded.** Seen on OpenWrt 25.12: the rows reached flash and the
+  RAM buffer emptied, but the page reported a failure — the worst kind of
+  wrong, because it teaches you to distrust a working flush.
+
+  The ucode backend parses the helper's *entire* stdout as one JSON object, so
+  a single stray byte from any command the script calls breaks it. The script
+  itself never printed outside the final line, but it calls `uci`, `awk`,
+  `sort`, `grep`, `find`, `logger`, `mkdir` and `mv` — on firmware this was
+  never run against.
+
+  Rather than chase which one is chatty on which build, stdout is now reserved
+  for the result: the script hands its JSON out on fd 3 and points fd 1 at
+  stderr, which every caller already discards. Anything added later is safe by
+  construction instead of by review. Command substitution is unaffected, since
+  `$(...)` redirects fd 1 for its own subshell.
+
+  The regression test poisons `mkdir` — one of the few commands whose output
+  is not already swallowed by a `$( )` — and asserts the result still parses,
+  is one line, says `ok`, and that the row was written.
+
 ## [1.0.0] — 2026-09-03
 
 First release.
