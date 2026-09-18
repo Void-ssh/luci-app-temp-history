@@ -30,7 +30,8 @@
 					"autoFan",
 					"setSetpoints",
 					"resetSetpoints",
-					"resetSys"
+					"resetSys",
+					"resetHistory"
 				],
 				"luci.temp-history": [
 					"flush",
@@ -39,7 +40,8 @@
 					"autoFan",
 					"setSetpoints",
 					"resetSetpoints",
-					"resetSys"
+					"resetSys",
+					"resetHistory"
 				]
 			},
 			"uci": [

@@ -22,6 +22,7 @@
 //   autoFan         (write) hand the fan straight back to the kernel governor
 //   setSetpoints    (write) new minimum/maximum thermal setpoints
 //   resetSetpoints  (write) restore the firmware's factory setpoints
+//   resetHistory    (write) start a fresh series — rollup only, or everything
 //
 // ucode is only available from OpenWrt 22.03 onward. On 21.02 this file is
 // never loaded, no methods exist, and the frontend falls back to the CGI.
@@ -41,6 +42,7 @@ const FAN_SCRIPT   = '/usr/libexec/temp-history/fan-control.sh';
 const SETP_SCRIPT  = '/usr/libexec/temp-history/glfan-setpoints.sh';
 const DEV_SCRIPT   = '/usr/libexec/temp-history/device-info.sh';
 const EVT_SCRIPT   = '/usr/libexec/temp-history/events.sh';
+const RST_SCRIPT   = '/usr/libexec/temp-history/reset-history.sh';
 
 const DEFAULT_WARN = 65;
 const DEFAULT_CRIT = 80;
@@ -322,6 +324,18 @@ function getEvents(request) {
 	return run_json(EVT_SCRIPT + ' ' + n, 'events helper');
 }
 
+// Rotates series aside. The helper owns the rules — which files, the shared
+// flush lock, and the fact that nothing is ever deleted — so the two backends
+// cannot drift into disagreeing about what "reset" destroys.
+function resetHistory(request) {
+	let scope = request?.args ? request.args.scope : null;
+	if (scope != 'daily' && scope != 'all')
+		return { status: 'error', error: 'scope must be daily or all' };
+	if (!readfile(RST_SCRIPT))
+		return { status: 'error', error: 'reset helper missing' };
+	return run_json(RST_SCRIPT + ' ' + scope, 'reset helper');
+}
+
 function doFlush() {
 	return run_json(FLUSH_SCRIPT, 'flush helper');
 }
@@ -428,6 +442,10 @@ const methods = {
 	getEvents: {
 		args: { limit: 0 },
 		call: getEvents
+	},
+	resetHistory: {
+		args: { scope: 'all' },
+		call: resetHistory
 	},
 	resetSys: {
 		args: { col: 0 },

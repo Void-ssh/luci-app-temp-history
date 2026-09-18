@@ -21,6 +21,7 @@ FANCTL="$HELPER_DIR/fan-control.sh"
 SETPOINTS="$HELPER_DIR/glfan-setpoints.sh"
 DEVINFO="$HELPER_DIR/device-info.sh"
 EVENTS="$HELPER_DIR/events.sh"
+RESETH="$HELPER_DIR/reset-history.sh"
 CGI="/www/cgi-bin/get-temp-history.cgi"
 RPCD_PLUGIN="/usr/libexec/rpcd/luci.temp-history"
 DATA_DIR="/root/website"
@@ -34,7 +35,7 @@ do_install() {
   # supported:false, and the panel then says "nothing logged" — which is the
   # one thing it exists to never say wrongly.
   chmod 0755 "$COLLECT" "$FLUSH" "$FANCTL" "$SETPOINTS" "$DEVINFO" "$EVENTS" \
-             "$CGI" "$RPCD_PLUGIN" 2>/dev/null
+             "$RESETH" "$CGI" "$RPCD_PLUGIN" 2>/dev/null
 
   mkdir -p "$DATA_DIR"
 
@@ -82,10 +83,19 @@ do_install() {
   # One collection immediately, so the page has something to show.
   "$COLLECT" >/dev/null 2>&1 &
 
-  # rpcd must reload for the ACL scope and the ubus methods to register.
-  # Until it does the frontend falls back to the CGI, so a missed reload
-  # degrades rather than breaks.
-  /etc/init.d/rpcd reload >/dev/null 2>&1 || true
+  # RESTART, not reload. rpcd builds its method table when it loads, so a
+  # `reload` re-reads the ACLs but leaves a newly added ubus method missing —
+  # verified on a live router, where resetHistory did not appear in
+  # `ubus -v list luci.temp-status` until rpcd was restarted by hand. The
+  # frontend then falls back to the CGI, and for the methods that have no CGI
+  # route (fan control, setpoints, reset) the button simply fails.
+  #
+  # The cost is that ubus sessions are dropped, so an admin who is signed in
+  # to LuCI during the upgrade may have to sign in again. That is a far
+  # smaller surprise than a control that does nothing until someone thinks to
+  # restart a daemon.
+  /etc/init.d/rpcd restart >/dev/null 2>&1 || \
+    /etc/init.d/rpcd reload >/dev/null 2>&1 || true
 
   rm -f /tmp/luci-indexcache* 2>/dev/null
   rm -rf /tmp/luci-modulecache 2>/dev/null

@@ -516,6 +516,23 @@ document.head.append(E('style', { type: 'text/css' }, `
      this is what you notice in passing. */
   .th-age-stale { color: var(--th-warn); font-weight: bold; }
 
+  /* Start a fresh series. The destructive button is the only red control on
+     the page, which is the point: nothing else here can lose data. */
+  .th-reset-box {
+    display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+    margin-top: 0.9rem; padding-top: 0.7rem;
+    border-top: 1px solid rgba(128,128,128,0.18);
+  }
+  .th-reset-label {
+    font-size: 0.68rem; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--th-dim); flex-basis: 100%;
+  }
+  .th-danger {
+    background: transparent !important; color: var(--th-hot) !important;
+    border: 1px solid var(--th-hot) !important;
+  }
+  .th-danger:hover { background: var(--th-hot) !important; color: #fff !important; }
+
   /* Current uptime, on the uptime chart's title line. Brighter than the label
      around it: the label is a caption, this is a reading. */
   .th-uptime-now { color: var(--th-good); font-weight: bold; }
@@ -1609,6 +1626,17 @@ return view.extend({
     params: [ 'limit' ], expect: { '': {} }
   }),
 
+  // Start a fresh series. ubus-only: destructive and unauthenticated have no
+  // business in the same endpoint.
+  callResetHistory: rpc.declare({
+    object: 'luci.temp-status', method: 'resetHistory',
+    params: [ 'scope' ], expect: { '': {} }
+  }),
+  callResetHistoryCompat: rpc.declare({
+    object: 'luci.temp-history', method: 'resetHistory',
+    params: [ 'scope' ], expect: { '': {} }
+  }),
+
   _useCompat:   false,
   _useCgiWrite: false,
 
@@ -1672,6 +1700,7 @@ return view.extend({
         case 'resetSetpoints': return this.callResetSetpoints();
         case 'getDevice':      return this.callGetDevice();
         case 'getEvents':      return this.callGetEvents(arg || 60);
+        case 'resetHistory':   return this.callResetHistory(arg);
       }
     };
     const secondary = () => {
@@ -1686,6 +1715,7 @@ return view.extend({
         case 'resetSetpoints': return this.callResetSetpointsCompat();
         case 'getDevice':      return this.callGetDeviceCompat();
         case 'getEvents':      return this.callGetEventsCompat(arg || 60);
+        case 'resetHistory':   return this.callResetHistoryCompat(arg);
       }
     };
     const isFan = (kind === 'setFan' || kind === 'autoFan');
@@ -1693,7 +1723,8 @@ return view.extend({
                     kind === 'resetSetpoints');
     const isDev = (kind === 'getDevice');
     const isEvt = (kind === 'getEvents');
-    const ubusOnly = isFan || isSetp || isDev || isEvt;
+    const isRst = (kind === 'resetHistory');
+    const ubusOnly = isFan || isSetp || isDev || isEvt || isRst;
 
     if (this._useCgiWrite && !ubusOnly)
       return this.cgiMutation(query, timeout);
@@ -1713,6 +1744,12 @@ return view.extend({
           // A router with no ubus backend cannot show events, and that is not
           // a failure worth a banner — the panel says so in its own body.
           return { supported: false, reason: _('needs the ubus backend'), events: [] };
+        if (isRst)
+          // Unlike the read-only degradations above, silence here would be
+          // wrong: the user asked for something destructive and nothing
+          // happened. Say so.
+          return { status: 'error',
+                   error: _('the ubus backend did not answer. If the package was just upgraded, run /etc/init.d/rpcd restart on the router and sign in to LuCI again — rpcd only registers new methods when it restarts.') };
         if (isFan)
           return { status:'error',
                    error: _('fan control needs the ubus backend — check `ubus list | grep temp`') };
@@ -2299,9 +2336,80 @@ return view.extend({
         fFanMin ? fFanMin.node : null,
         save, msg,
         this.buildSetpoints(data),   // null on anything but GL.iNet firmware
+        this.buildResetHistory(data),
         verNode
       ]))
     ]);
+  },
+
+  // ── Starting a fresh series ────────────────────────────────────────────
+  // TWO buttons, not one, because the two actions differ in kind and a single
+  // "wipe" would have to be as frightening as its worst half.
+  //
+  //   Rebuild daily summary  is a REPAIR. roll_daily recomputes every complete
+  //                          day still in temp-history.tsv on the next flush,
+  //                          so almost nothing is lost. No confirmation.
+  //   Wipe all history       is the only irreversible action in the package.
+  //                          Confirmed, and the dialog names the row count so
+  //                          the number itself gives you pause.
+  //
+  // Neither deletes: the helper renames each file to <name>.<timestamp>.old,
+  // the same thing a sensor-set change already does. A mis-click costs an
+  // `mv` over SSH rather than six months of readings, and the page says where
+  // the old files went.
+  buildResetHistory(data) {
+    const self = this;
+    const msg  = E('div', { class:'th-fan-note' }, '');
+
+    const mkBtn = (label, cls, handler) => {
+      const b = E('button', { type:'button', class:cls }, label);
+      b.addEventListener('click', handler);
+      return b;
+    };
+
+    const daily = mkBtn(_('Rebuild daily summary'), 'th-range-btn',
+      () => self.doResetHistory('daily', msg, null));
+
+    const all = mkBtn(_('Wipe all history'), 'th-save th-danger', () => {
+      const rows = (data && data.total_rows) || 0;
+      self.doResetHistory('all', msg,
+        _('Set every series aside and start again?') + '\n\n' +
+        _('This covers temperatures, fan, CPU/memory, uptime and the daily summary') +
+        ' — ' + rows + ' ' + _('recorded rows') + '.\n\n' +
+        _('Nothing is deleted: each file is renamed to .old beside itself, and the daily summary is the only part that rebuilds.'));
+    });
+
+    return E('div', { class:'th-reset-box' }, [
+      E('div', { class:'th-reset-label' }, _('Start a fresh series')),
+      daily, all, msg
+    ]);
+  },
+
+  doResetHistory(scope, msg, confirmText) {
+    if (confirmText && !window.confirm(confirmText)) return Promise.resolve();
+    const self = this;
+    msg.textContent = _('Working…');
+    return this.mutate('resetHistory', scope, 15000)
+      .then(r => {
+        if (!r || r.status !== 'ok') {
+          msg.textContent = _('Failed:') + ' ' +
+            ((r && r.error) ? r.error : _('unknown error'));
+          return;
+        }
+        // Say where it went. "Done" would leave the one fact that makes this
+        // recoverable — the .old files — undiscoverable.
+        const files = Array.isArray(r.rotated) ? r.rotated : [];
+        msg.textContent = (r.rotated_files || 0) + ' ' + _('file(s) set aside') +
+          ', ' + (r.rotated_rows || 0) + ' ' + _('rows') +
+          (files.length ? ' — ' + files.join(', ') : '');
+        if (self._destroyed) return;
+        return self.fetchFull().then(fresh => {
+          if (!self._destroyed) self.applyFull(fresh);
+        }).catch(() => {});
+      })
+      .catch(e => {
+        msg.textContent = _('Failed:') + ' ' + ((e && e.message) ? e.message : e);
+      });
   },
 
   // ── GL.iNet thermal setpoints ──────────────────────────────────────────

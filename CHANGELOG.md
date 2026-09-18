@@ -4,6 +4,57 @@ Notable changes to this project, newest first. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [semantic versioning](https://semver.org/).
 
+## [1.1.1] — 2026-09-18
+
+### Fixed
+
+- **New ubus methods were not registered until rpcd was restarted by hand.**
+  Install ran `/etc/init.d/rpcd reload`, which re-reads the ACLs but leaves a
+  newly added method missing from the plugin's table — confirmed on a live
+  router, where `resetHistory` was absent from `ubus -v list luci.temp-status`
+  until rpcd was restarted. Methods with a CGI fallback degraded quietly; the
+  ones without (fan control, setpoints, reset) simply failed.
+
+  Install now restarts rpcd, falling back to a reload if that fails. The cost
+  is that ubus sessions are dropped, so an admin signed in during an upgrade
+  may have to sign in again — a far smaller surprise than a control that does
+  nothing until someone thinks to restart a daemon.
+
+- The matching error message now says what to do — restart rpcd and sign in
+  again — instead of suggesting `ubus list`, which confirms a method is missing
+  without hinting at the cause.
+
+## [1.1.0] — 2026-09-18
+
+### Added
+
+- **Start a fresh series, from Settings.** Two buttons, because the two
+  actions differ in kind and one combined "wipe" would have to be as
+  frightening as its worst half:
+
+  - **Rebuild daily summary** sets `temp-daily.tsv` aside. This is a *repair*,
+    not a loss — the next flush recomputes every complete day still present in
+    the 15-minute series. No confirmation, because nothing meaningful is at
+    risk.
+  - **Wipe all history** sets every series aside as well: temperatures, fan,
+    CPU/memory, uptime and the rollup. Confirmed, and the dialog names the
+    recorded row count so the number itself gives you pause. It also clears
+    the RAM buffers — leaving them would let the next flush append readings
+    from before the reset onto the fresh file, exactly the mixing the schema
+    header exists to prevent — and the per-sensor min/max cutoffs, which with
+    no readings left could only hide the new series from itself.
+
+  **Nothing is deleted.** Each file is renamed to `<name>.<timestamp>.old`,
+  the same thing a sensor-set change has always done. A mis-click costs an
+  `mv` over SSH rather than six months of readings, and the page reports the
+  paths so they can be removed deliberately.
+
+  The helper takes the **same lock as the flush**: renaming a series out from
+  under a running flush would let it append to a file nobody will read again.
+  `resetHistory` is on both rpcd backends and, like the setpoints, deliberately
+  absent from the CGI — destructive and unauthenticated do not belong in the
+  same endpoint.
+
 ## [1.0.2] — 2026-09-18
 
 ### Fixed

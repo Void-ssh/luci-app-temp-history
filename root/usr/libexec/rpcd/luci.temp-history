@@ -45,6 +45,7 @@ FAN_SCRIPT="/usr/libexec/temp-history/fan-control.sh"
 SETP_SCRIPT="/usr/libexec/temp-history/glfan-setpoints.sh"
 DEV_SCRIPT="/usr/libexec/temp-history/device-info.sh"
 EVT_SCRIPT="/usr/libexec/temp-history/events.sh"
+RST_SCRIPT="/usr/libexec/temp-history/reset-history.sh"
 
 # Extract one integer field from the arguments JSON. jshn is present on every
 # OpenWrt install, but this runs in rpcd's context and a missing include would
@@ -84,7 +85,7 @@ json_int_field() {  # json_int_field <name> <json>
 
 case "$1" in
   list)
-    printf '{ "flush": { }, "reset": { "sensor": 0 }, "getFan": { }, "setFan": { "percent": 0, "minutes": 0 }, "autoFan": { }, "getSetpoints": { }, "setSetpoints": { "min": 0, "max": 0 }, "resetSetpoints": { }, "getDevice": { }, "resetSys": { "col": 0 }, "getEvents": { "limit": 0 } }\n'
+    printf '{ "flush": { }, "reset": { "sensor": 0 }, "getFan": { }, "setFan": { "percent": 0, "minutes": 0 }, "autoFan": { }, "getSetpoints": { }, "setSetpoints": { "min": 0, "max": 0 }, "resetSetpoints": { }, "getDevice": { }, "resetSys": { "col": 0 }, "getEvents": { "limit": 0 }, "resetHistory": { "scope": "all" } }\n'
     ;;
 
   call)
@@ -245,6 +246,24 @@ case "$1" in
           # Not an error: a router with no events and a router with no helper
           # look the same to the page, and both should just draw nothing.
           printf '{"supported":false,"reason":"events helper missing","events":[]}\n'
+        fi
+        ;;
+
+      # Start a fresh series. The helper owns every rule, including that
+      # nothing is deleted — only renamed aside — so both backends behave
+      # identically. Deliberately absent from the CGI: destructive and
+      # unauthenticated do not belong in the same sentence.
+      resetHistory)
+        INPUT=$(cat)
+        SCOPE=$(printf '%s' "$INPUT" | sed -n 's/.*"scope"[[:space:]]*:[[:space:]]*"\{0,1\}\([a-z]*\).*/\1/p')
+        case "$SCOPE" in
+          daily|all) ;;
+          *) printf '{"status":"error","error":"scope must be daily or all"}\n'; exit 0 ;;
+        esac
+        if [ -x "$RST_SCRIPT" ]; then
+          "$RST_SCRIPT" "$SCOPE"
+        else
+          printf '{"status":"error","error":"reset helper missing"}\n'
         fi
         ;;
 
