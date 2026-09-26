@@ -1,0 +1,13 @@
+{
+	"admin/status/realtime/temperature-history": {
+		"title": "Temperature",
+		"order": 11,
+		"action": {
+			"type": "view",
+			"path": "status/temperature-history"
+		},
+		"depends": {
+			"acl": [ "luci-app-temp-history" ]
+		}
+	}
+}

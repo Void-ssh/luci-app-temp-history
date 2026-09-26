@@ -1,0 +1,69 @@
+
+config temp-history 'main'
+	# Card/chart colouring and the dashed threshold lines on the chart.
+	option warn_temp '65'
+	option crit_temp '80'
+
+	# Rows kept in temp-history.tsv and in the RAM buffer.
+	# 2880 = 30 days at 15-minute intervals.
+	option max_rows '2880'
+
+	# Who may run flush / reset over the unauthenticated CGI.
+	#   auto - refuse when the authenticated ubus method is reachable
+	#          (OpenWrt 22.03+), allow otherwise. This is the default and
+	#          the right answer for almost everyone: it closes the CGI on
+	#          routers that don't need it and leaves it open on 21.02,
+	#          which has no ucode and therefore no ubus backend.
+	#   0    - never. The buttons stop working on routers without ubus.
+	#   1    - always. POST and a matching Origin are still required, but
+	#          nothing authenticates the caller. Only set this if you know why.
+	option cgi_write 'auto'
+
+	# ── Fan ──────────────────────────────────────────────────────
+	# Monitoring needs no configuration; these only affect manual control.
+	# On passively cooled hardware they are simply unused.
+
+	# 0 disables manual fan control entirely. The kernel thermal governor
+	# keeps managing the fan, and the UI hides the control.
+	option fan_control '1'
+
+	# Floor for a manual setting, as a percentage. Asking for less than this
+	# gets this instead, so the UI cannot be used to stall the fan. Editable
+	# from the Settings panel on the Temperature page.
+	#
+	# 25 is a conservative default, not a measurement of YOUR fan. A PWM fan
+	# needs more duty to start from stopped than to keep running, so the
+	# number worth setting here is the lowest percent that reliably RESTARTS
+	# it. Walk it down with `fan-control.sh set <pct> 2` and watch fanN_input;
+	# where the RPM stops falling as the percent falls, you have reached the
+	# fan's own floor and lower settings buy nothing. 0 removes the floor.
+	option fan_min_percent '25'
+
+	# How long a manual override lasts before control returns to the kernel
+	# automatically. Also returned early if any sensor reaches crit_temp.
+	option fan_override_minutes '30'
+
+	# ── GL.iNet thermal setpoints ────────────────────────────────
+	# Only used on GL.iNet stock firmware, where the fan is regulated by the
+	# gl_fan daemon rather than by the kernel thermal governor. Everywhere
+	# else these are inert and the Settings panel hides the section.
+	#
+	# Setting the minimum/maximum setpoints always updates gl_fan's own
+	# configuration (uci glfan.globals.* and /lib/functions/gl_util.sh).
+	# It additionally rewrites GL's admin web-UI bundles — so ITS slider also
+	# shows the widened range — only when this is 1.
+	#
+	# 0 is the default and the right answer if you drive the fan from this
+	# page: patching minified firmware bundles is the risky half, it is undone
+	# by any firmware upgrade, and it changes nothing about cooling. Turn it on
+	# if you also use GL's own admin page, where an un-widened slider will snap
+	# a setpoint above 90 °C back down.
+	option glfan_ui_patch '0'
+
+	# Written by the Settings panel, not meant to be edited by hand: the
+	# maximum setpoint last applied. gl_fan has no UCI home for a ceiling —
+	# on stock firmware it exists only as a literal inside the web-UI bundle —
+	# so it is recorded here, otherwise a router configured with the UI patch
+	# switched off would report a stale factory 90.
+	# option glfan_max '95'
+	# option glfan_min '55'

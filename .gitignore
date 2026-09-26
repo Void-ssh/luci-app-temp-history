@@ -1,0 +1,18 @@
+# Build output
+/dist/
+*.ipk
+*.apk
+
+# Editors / OS
+*.swp
+*~
+.DS_Store
+
+# Test staging (tests/lib.sh stages into /tmp by default; this covers a
+# TH_STAGE pointed at the working tree)
+/tests/.stage/
+
+# Not published. The suite needs fixtures and firmware transcripts that live
+# outside this repository, and shipping half of it would be worse than none.
+/tests/
+/.github/
